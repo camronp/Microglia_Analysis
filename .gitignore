@@ -14,3 +14,7 @@ morphology_plots*/
 # Local tooling state
 .claude/
 omnipathr-log/
+
+# Temporarily excluded - not ready to share yet
+*.Rproj
+analysis_v2.1.Rmd
