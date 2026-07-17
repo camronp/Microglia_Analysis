@@ -1,0 +1,16 @@
+# Morphology data (raw source CSVs + the merged cache) - stays local
+*.csv
+
+# Generated plot outputs
+density_plots*/
+morphology_plots*/
+
+# R / RStudio artifacts
+.Rhistory
+.Rproj.user/
+.RData
+*.Rproj.user
+
+# Local tooling state
+.claude/
+omnipathr-log/
