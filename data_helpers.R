@@ -285,15 +285,61 @@ compare_pairs_all_metrics <- function(data, metrics = all_cell_metrics, group_co
 }
 
 
+pair_labels <- function(pw) paste(pw$group1, "vs", pw$group2)
+
+# The significant pairs to bracket, with rstatix's computed y.position for
+# each (in the metric's own data units) - the single source of truth both
+# plot_single_metric_pub() and bracket_plot_height() build on, so the
+# reserved margin always matches where rstatix actually places the brackets
+# (which is based on rstatix's own internal range, not necessarily the full
+# min/max of the plotted data - see bracket_margin_inches()).
+bracket_layout <- function(data, metric, group_col = "group", bracket_spacing = 0.15,
+                            max_groups_for_brackets = 8, selected_pairs = NULL) {
+  n_grp <- n_distinct(data[[group_col]])
+  if (n_grp < 2 || n_grp > max_groups_for_brackets) return(NULL)
+  pw <- compare_pairs_metric(data, metric, group_col)
+  if (is.null(pw)) return(NULL)
+  sig <- pw %>% filter(p.adj < 0.05)
+  if (!is.null(selected_pairs)) sig <- sig %>% filter(pair_labels(sig) %in% selected_pairs)
+  if (nrow(sig) == 0) return(NULL)
+  rstatix::add_xy_position(sig, x = group_col, step.increase = bracket_spacing)
+}
+
+# Inches of top margin needed so the highest bracket in sig_pos isn't
+# clipped, expressed as "how many panel-heights above the visible axis range
+# does it sit" - measured directly from rstatix's own y.position values
+# rather than estimated, since rstatix scales step.increase using its own
+# internal range (max per group vs min-of-per-group-max) which doesn't match
+# the plotted data's full min/max closely enough to predict analytically.
+bracket_margin_inches <- function(sig_pos, values, bracket_size, base_height = 5.5) {
+  values <- values[!is.na(values)]
+  y_range <- range(values)
+  y_pad <- diff(y_range) * 0.05
+  if (y_pad == 0) y_pad <- 1
+  panel_span <- diff(y_range) + 2 * y_pad
+  overshoot <- max(0, max(sig_pos$y.position, na.rm = TRUE) - (y_range[2] + y_pad))
+  (overshoot / panel_span) * base_height + nrow(sig_pos) * (0.12 + bracket_size * 0.03)
+}
+
 plot_single_metric_pub <- function(data, metric, group_col = "group", group_label = NULL,
                                     title = NULL, max_groups_for_brackets = 8,
-                                    bracket_size = 4, title_size = 16, label_size = 15) {
+                                    bracket_size = 4, bracket_spacing = 0.15,
+                                    title_size = 16, label_size = 15,
+                                    selected_pairs = NULL) {
   n_grp <- n_distinct(data[[group_col]])
 
   plt_df <- data %>%
     select(all_of(group_col), all_of(metric)) %>%
     rename(value = all_of(metric)) %>%
     filter(!is.na(value))
+
+  # Fix the y-axis to the real data range (with a small fixed pad) instead of
+  # letting it auto-expand to fit the brackets - that expansion is what used
+  # to squash the violins down into a fraction of the panel. Brackets are
+  # drawn above this range in reserved margin space instead (clip = "off").
+  y_range <- range(plt_df$value, na.rm = TRUE)
+  y_pad <- diff(y_range) * 0.05
+  if (y_pad == 0) y_pad <- 1
 
   p <- ggplot(plt_df, aes(x = .data[[group_col]], y = value, fill = .data[[group_col]])) +
     geom_violin(alpha = 0.25, colour = "black", linewidth = 0.4, trim = TRUE, na.rm = TRUE) +
@@ -307,36 +353,37 @@ plot_single_metric_pub <- function(data, metric, group_col = "group", group_labe
           axis.text.x = element_text(angle = 30, hjust = 1, size = label_size * 0.8),
           axis.text.y = element_text(size = label_size * 0.8))
 
-  if (n_grp >= 2 && n_grp <= max_groups_for_brackets) {
-    pw <- compare_pairs_metric(data, metric, group_col)
-    sig <- if (!is.null(pw)) pw %>% filter(p.adj < 0.05) else NULL
-    if (!is.null(sig) && nrow(sig) > 0) {
-
-      step_inc <- 0.20 + bracket_size * 0.045
-      sig_pos <- rstatix::add_xy_position(sig, x = group_col, step.increase = step_inc)
-      p <- p + ggpubr::stat_pvalue_manual(sig_pos, label = "p.adj.signif",
-                                           tip.length = 0.01, size = bracket_size,
-                                           bracket.size = bracket_size / 10) +
-        scale_y_continuous(expand = expansion(mult = c(0.05, 0.08 + 0.02 * bracket_size)))
-    }
+  bracket_margin_in <- 0
+  sig_pos <- bracket_layout(data, metric, group_col, bracket_spacing, max_groups_for_brackets, selected_pairs)
+  if (!is.null(sig_pos)) {
+    bracket_margin_in <- bracket_margin_inches(sig_pos, plt_df$value, bracket_size)
+    p <- p + ggpubr::stat_pvalue_manual(sig_pos, label = "p.adj.signif",
+                                         tip.length = 0.01, size = bracket_size,
+                                         bracket.size = bracket_size / 10)
   }
-  p
+
+  p + coord_cartesian(ylim = c(y_range[1] - y_pad, y_range[2] + y_pad),
+                       clip = if (bracket_margin_in > 0) "off" else "on") +
+    theme(plot.margin = margin(t = bracket_margin_in, r = 0.08, b = 0.08, l = 0.08,
+                                unit = "in"))
 }
 
 
-n_significant_pairs <- function(data, metric, group_col = "group", max_groups_for_brackets = 8) {
-  n_grp <- n_distinct(data[[group_col]])
-  if (n_grp < 2 || n_grp > max_groups_for_brackets) return(0L)
-  pw <- compare_pairs_metric(data, metric, group_col)
-  if (is.null(pw)) return(0L)
-  sum(pw$p.adj < 0.05, na.rm = TRUE)
+n_significant_pairs <- function(data, metric, group_col = "group", max_groups_for_brackets = 8,
+                                 selected_pairs = NULL) {
+  sig_pos <- bracket_layout(data, metric, group_col, max_groups_for_brackets = max_groups_for_brackets,
+                             selected_pairs = selected_pairs)
+  if (is.null(sig_pos)) 0L else nrow(sig_pos)
 }
 
 
 bracket_plot_height <- function(data, metric, group_col = "group", bracket_size = 4,
-                                 max_groups_for_brackets = 8, base_height = 5.5) {
-  n_sig <- n_significant_pairs(data, metric, group_col, max_groups_for_brackets)
-  base_height + n_sig * (0.55 + bracket_size * 0.10)
+                                 bracket_spacing = 0.15, max_groups_for_brackets = 8,
+                                 base_height = 5.5, selected_pairs = NULL) {
+  sig_pos <- bracket_layout(data, metric, group_col, bracket_spacing, max_groups_for_brackets, selected_pairs)
+  if (is.null(sig_pos)) return(base_height)
+  values <- data[[metric]]
+  base_height + bracket_margin_inches(sig_pos, values, bracket_size, base_height)
 }
 
 

@@ -63,6 +63,9 @@ ui <- fluidPage(
                 placeholder = "leave blank to use the metric name"),
       sliderInput("bracket_size", "Bracket/asterisk size", min = 2, max = 8,
                   value = 4, step = 0.5),
+      sliderInput("bracket_spacing", "Bracket spacing", min = 0.08, max = 0.4,
+                  value = 0.15, step = 0.01),
+      uiOutput("bracket_pairs_ui"),
       sliderInput("title_size", "Title size", min = 8, max = 28,
                   value = 16, step = 1),
       sliderInput("label_size", "Axis label size", min = 8, max = 24,
@@ -177,6 +180,46 @@ server <- function(input, output, session) {
     if (nzchar(trimws(input$plot_title))) input$plot_title else metric_label(input$metric)
   })
 
+  # Which pairwise comparisons are significant for the current metric/groups -
+  # the candidate set the "brackets to show" checkboxes are built from.
+  sig_pairs <- reactive({
+    fd <- filtered_df()
+    req(input$metric)
+    if (n_distinct(fd$group) < 2 || n_distinct(fd$group) > 8) return(NULL)
+    pw <- compare_pairs_metric(fd, input$metric, "group")
+    if (is.null(pw)) return(NULL)
+    sig <- pw %>% filter(p.adj < 0.05)
+    if (nrow(sig) == 0) return(NULL)
+    sig
+  })
+
+  output$bracket_pairs_ui <- renderUI({
+    sig <- sig_pairs()
+    if (is.null(sig)) return(NULL)
+    labels <- pair_labels(sig)
+    tagList(
+      tags$strong("Significance brackets to show"),
+      lapply(seq_along(labels), function(i) {
+        checkboxInput(paste0("bracket_show_", i), label = labels[i], value = TRUE)
+      })
+    )
+  })
+
+  # Individually-named checkboxes (rather than one checkboxGroupInput) so an
+  # unchecked box is unambiguous - checkboxGroupInput reports NULL both when
+  # the client hasn't echoed its initial value yet and when everything's been
+  # unchecked, which briefly hid every bracket on first load.
+  bracket_pairs_selected <- reactive({
+    sig <- sig_pairs()
+    if (is.null(sig)) return(NULL)
+    labels <- pair_labels(sig)
+    keep <- vapply(seq_along(labels), function(i) {
+      v <- input[[paste0("bracket_show_", i)]]
+      if (is.null(v)) TRUE else v
+    }, logical(1))
+    labels[keep]
+  })
+
   # A fixed device height can't fit an arbitrary number of stacked
   # significance brackets without them overlapping - the panel has to grow
   # with the stack. bracket_plot_height() (data_helpers.R) returns however
@@ -184,7 +227,9 @@ server <- function(input, output, session) {
   plot_height_px <- reactive({
     fd <- filtered_df()
     req(nrow(fd) > 0)
-    bracket_plot_height(fd, input$metric, "group", bracket_size = input$bracket_size) * 96
+    bracket_plot_height(fd, input$metric, "group", bracket_size = input$bracket_size,
+                         bracket_spacing = input$bracket_spacing,
+                         selected_pairs = bracket_pairs_selected()) * 96
   })
 
   output$morph_plot <- renderPlot({
@@ -193,7 +238,9 @@ server <- function(input, output, session) {
     plot_single_metric_pub(fd, input$metric, group_col = "group",
                             group_label = pretty_var(input$comparison_variable),
                             title = plot_title(), bracket_size = input$bracket_size,
-                            title_size = input$title_size, label_size = input$label_size)
+                            bracket_spacing = input$bracket_spacing,
+                            title_size = input$title_size, label_size = input$label_size,
+                            selected_pairs = bracket_pairs_selected())
   }, height = function() plot_height_px())
 
   output$counts_table <- renderDT({
@@ -238,11 +285,16 @@ server <- function(input, output, session) {
       p <- plot_single_metric_pub(fd, input$metric, group_col = "group",
                                    group_label = pretty_var(input$comparison_variable),
                                    title = plot_title(), bracket_size = input$bracket_size,
-                                   title_size = input$title_size, label_size = input$label_size)
-      h <- bracket_plot_height(fd, input$metric, "group", bracket_size = input$bracket_size)
+                                   bracket_spacing = input$bracket_spacing,
+                                   title_size = input$title_size, label_size = input$label_size,
+                                   selected_pairs = bracket_pairs_selected())
+      h <- bracket_plot_height(fd, input$metric, "group", bracket_size = input$bracket_size,
+                                bracket_spacing = input$bracket_spacing,
+                                selected_pairs = bracket_pairs_selected())
       ggsave(file, p, width = max(7, 1.2 + 1.1 * n_distinct(fd$group)), height = h, dpi = 300)
     }
   )
 }
 
 shinyApp(ui, server)
+
