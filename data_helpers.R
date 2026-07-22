@@ -10,6 +10,44 @@ okabe <- c("#0072B2", "#E69F00", "#009E73", "#D55E00",
 
 okabe_pal <- grDevices::colorRampPalette(okabe)
 
+# Palette choices for the app's "Color palette" dropdown. All but "custom"
+# are generated via base R's hcl.colors() (no extra package dependency).
+palette_choices <- c(
+  "Okabe-Ito (colorblind-safe)" = "okabe",
+  "Viridis"                     = "viridis",
+  "Set 2"                       = "set2",
+  "Dark 2"                      = "dark2",
+  "Pastel 1"                    = "pastel1",
+  "Custom"                      = "custom"
+)
+
+# Resolves a palette dropdown choice (plus optional user-entered custom hex
+# codes) into a vector of n fill colors for plot_single_metric_pub(). Falls
+# back to the Okabe-Ito default if "custom" is selected but no valid hex
+# codes were entered.
+resolve_palette <- function(name, n, custom_colors = NULL) {
+  n <- max(as.integer(n), 1L)
+  if (identical(name, "custom")) {
+    cols <- trimws(custom_colors)
+    cols <- cols[nzchar(cols)]
+    cols <- ifelse(grepl("^#", cols), cols, paste0("#", cols))
+    cols <- cols[grepl("^#[0-9A-Fa-f]{6}$", cols)]
+    if (length(cols) >= 1) {
+      if (length(cols) == 1) cols <- rep(cols, 2)
+      return(grDevices::colorRampPalette(cols)(n))
+    }
+    name <- "okabe"
+  }
+  switch(name,
+    okabe   = okabe_pal(n),
+    viridis = grDevices::hcl.colors(n, "Viridis"),
+    set2    = grDevices::hcl.colors(n, "Set 2"),
+    dark2   = grDevices::hcl.colors(n, "Dark 2"),
+    pastel1 = grDevices::hcl.colors(n, "Pastel 1"),
+    okabe_pal(n)
+  )
+}
+
 theme_pub <- theme_minimal(base_size = 15) +
   theme(
     axis.line          = element_line(linewidth = 0.8, colour = "black"),
@@ -70,7 +108,15 @@ metric_label <- function(m) {
     n_triple_points         = "Triple Points",
     n_quadruple_points      = "Quadruple Points",
     aspect_ratio            = "Aspect Ratio",
-    polarity_offset_um      = paste0("Polarity Offset (", um, ")")
+    polarity_offset_um      = paste0("Polarity Offset (", um, ")"),
+    mean_intensity          = "Mean Intensity (a.u.)",
+    median_intensity        = "Median Intensity (a.u.)",
+    min_intensity           = "Min Intensity (a.u.)",
+    max_intensity           = "Max Intensity (a.u.)",
+    stddev_intensity        = "Std. Dev. Intensity (a.u.)",
+    integrated_density      = "Integrated Density (a.u.)",
+    raw_integrated_density  = "Raw Integrated Density (a.u.)",
+    area_px                 = "Cell Area (px)"
   )
   if (m %in% names(labels)) unname(labels[m]) else str_to_title(gsub("_", " ", m))
 }
@@ -129,7 +175,9 @@ load_morphology_data <- function(dir = ".",
                                   cache_file = file.path(dir, "merged_morphology_data.csv"),
                                   force_rebuild = FALSE) {
   csv_files <- list.files(dir, pattern = "\\.csv$", full.names = TRUE)
-  csv_files <- csv_files[!basename(csv_files) %in% basename(c(metadata_file, cache_file))]
+  csv_files <- csv_files[!basename(csv_files) %in%
+                           basename(c(metadata_file, cache_file, "merged_intensity_data.csv"))]
+  csv_files <- csv_files[!grepl("^channel_intensity_results_.*\\.csv$", basename(csv_files))]
 
   cache_exists <- file.exists(cache_file)
   cache_fresh <- cache_exists && (
@@ -201,6 +249,55 @@ load_morphology_data <- function(dir = ".",
 
   attr(df, "n_csv_loaded") <- n_distinct(df$source_file)
   df
+}
+
+# ---- Channel intensity data (from the Channel Intensity Quantification --
+# macro's channel_intensity_results_*.csv) ---------------------------------
+# Unlike morphology CSVs (one per source image), the quantification macro
+# always produces a single combined file per run, long-format: one row per
+# cell per channel. There's nothing to merge, so - unlike morphology data -
+# this reads the native file directly with no on-disk cache. Returns an
+# empty tibble (with a message, not an error) if the macro hasn't been run
+# yet, so the app still starts fine; errors if more than one matching file
+# is present, since that means a stale run wasn't cleaned up.
+load_intensity_data <- function(dir = ".") {
+  csv_files <- list.files(dir, pattern = "^channel_intensity_results_.*\\.csv$", full.names = TRUE)
+
+  if (length(csv_files) == 0) {
+    message("No 'channel_intensity_results_*.csv' files found in '", normalizePath(dir),
+            "' - the Channel Intensity tab will be empty until you run the ",
+            "Channel Intensity Quantification macro.")
+    return(tibble())
+  }
+
+  if (length(csv_files) > 1) {
+    stop("Found multiple 'channel_intensity_results_*.csv' files in '", normalizePath(dir), "':\n  ",
+         paste(basename(csv_files), collapse = "\n  "),
+         "\nThe quantification macro only produces one at a time - delete the stale run(s) ",
+         "and keep just the current file.")
+  }
+
+  message("Reading channel intensity data: ", basename(csv_files))
+  d <- readr::read_csv(csv_files, show_col_types = FALSE)
+  needed <- c("cell_name", "source_image", "channel", "mean_intensity")
+  if (!all(needed %in% names(d))) {
+    stop("'", basename(csv_files), "' is missing expected columns (need at least ",
+         "cell_name/source_image/channel/mean_intensity). Make sure you're pointing at ",
+         "the Channel Intensity Quantification macro's output.")
+  }
+  d
+}
+
+# Attaches the same project/well_position/site/wavelength/image (+
+# sample_id/image_id) columns morphology_df already carries, matched by
+# cell_name - the two pipelines' cell_name values are identical for the
+# same cell, so this is an exact 1:1 join, no re-parsing of filenames needed.
+attach_cell_metadata <- function(intensity_df, morphology_df) {
+  if (nrow(intensity_df) == 0) return(intensity_df)
+  meta <- morphology_df %>%
+    distinct(cell_name, sample_id, image_id, cell_number,
+             project, well_position, site, wavelength, image)
+  intensity_df %>% left_join(meta, by = "cell_name")
 }
 
 # Shared analysis / plotting helpers
@@ -321,17 +418,39 @@ bracket_margin_inches <- function(sig_pos, values, bracket_size, base_height = 5
   (overshoot / panel_span) * base_height + nrow(sig_pos) * (0.12 + bracket_size * 0.03)
 }
 
+# Inches reserved for the plot title, now drawn as its own annotation above
+# the top bracket (see plot_single_metric_pub()) rather than ggplot's usual
+# title row, which sits immediately above the panel and so got run over by
+# any bracket tall enough to overflow into it.
+title_margin_inches <- function(title_size) 0.15 + title_size * 0.015
+
+# A few outlier cells (common in intensity channels - saturated pixels etc.)
+# can be orders of magnitude above the bulk of the data; since the axis is
+# locked to the real range (see plot_single_metric_pub()), that squashes
+# every violin into a flat sliver. log10-transforming the plotted values (and
+# the bracket y.position, which rstatix computed on the untransformed scale)
+# keeps them in sync without changing what the underlying stats test runs on.
+log10_sig_pos <- function(sig_pos) {
+  sig_pos$y.position <- log10(pmax(sig_pos$y.position, 1e-9))
+  sig_pos
+}
+
 plot_single_metric_pub <- function(data, metric, group_col = "group", group_label = NULL,
                                     title = NULL, max_groups_for_brackets = 8,
                                     bracket_size = 4, bracket_spacing = 0.15,
                                     title_size = 16, label_size = 15,
-                                    selected_pairs = NULL) {
+                                    title_justify = c("left", "center"),
+                                    log_scale = FALSE,
+                                    selected_pairs = NULL,
+                                    palette = NULL) {
+  title_justify <- match.arg(title_justify)
   n_grp <- n_distinct(data[[group_col]])
 
   plt_df <- data %>%
     select(all_of(group_col), all_of(metric)) %>%
     rename(value = all_of(metric)) %>%
     filter(!is.na(value))
+  if (log_scale) plt_df <- plt_df %>% filter(value > 0) %>% mutate(value = log10(value))
 
   # Fix the y-axis to the real data range (with a small fixed pad) instead of
   # letting it auto-expand to fit the brackets - that expansion is what used
@@ -340,31 +459,66 @@ plot_single_metric_pub <- function(data, metric, group_col = "group", group_labe
   y_range <- range(plt_df$value, na.rm = TRUE)
   y_pad <- diff(y_range) * 0.05
   if (y_pad == 0) y_pad <- 1
+  panel_span <- diff(y_range) + 2 * y_pad
 
   p <- ggplot(plt_df, aes(x = .data[[group_col]], y = value, fill = .data[[group_col]])) +
     geom_violin(alpha = 0.25, colour = "black", linewidth = 0.4, trim = TRUE, na.rm = TRUE) +
     geom_boxplot(width = 0.15, alpha = 0.9, colour = "black", outlier.shape = NA, linewidth = 0.4) +
     geom_jitter(width = 0.08, alpha = 0.5, size = 1.4, shape = 16, colour = "grey20") +
-    labs(title = if (!is.null(title)) title else metric,
-         x = group_label, y = metric_label(metric), fill = group_label) +
+    labs(x = group_label, y = metric_label(metric), fill = group_label) +
     theme(legend.position = if (n_grp > 8) "none" else "right",
-          plot.title  = element_text(size = title_size),
           axis.title  = element_text(size = label_size),
           axis.text.x = element_text(angle = 30, hjust = 1, size = label_size * 0.8),
           axis.text.y = element_text(size = label_size * 0.8))
 
+  if (!is.null(palette)) {
+    p <- p + scale_fill_manual(values = palette)
+  }
+
+  if (log_scale) {
+    p <- p + scale_y_continuous(labels = function(x) scales::comma(round(10^x)))
+  }
+
+  # The title used to be ggplot's own title row, which sits immediately
+  # above the panel - so any bracket tall enough to overflow past the panel
+  # (via clip = "off" below) ran straight into it. Drawing it as a manual
+  # annotation, positioned above the top bracket's own y.position (or just
+  # above the axis range if there are no brackets), keeps it clear no matter
+  # how many brackets are stacked.
   bracket_margin_in <- 0
+  top_y <- y_range[2] + y_pad
   sig_pos <- bracket_layout(data, metric, group_col, bracket_spacing, max_groups_for_brackets, selected_pairs)
   if (!is.null(sig_pos)) {
+    if (log_scale) sig_pos <- log10_sig_pos(sig_pos)
     bracket_margin_in <- bracket_margin_inches(sig_pos, plt_df$value, bracket_size)
+    top_y <- max(sig_pos$y.position, na.rm = TRUE)
     p <- p + ggpubr::stat_pvalue_manual(sig_pos, label = "p.adj.signif",
                                          tip.length = 0.01, size = bracket_size,
                                          bracket.size = bracket_size / 10)
   }
 
-  p + coord_cartesian(ylim = c(y_range[1] - y_pad, y_range[2] + y_pad),
-                       clip = if (bracket_margin_in > 0) "off" else "on") +
-    theme(plot.margin = margin(t = bracket_margin_in, r = 0.08, b = 0.08, l = 0.08,
+  title_extra_in <- title_margin_inches(title_size)
+  total_margin_in <- bracket_margin_in + title_extra_in
+  data_per_inch <- panel_span / 5.5
+  # top_y already sits bracket_margin_in's "overshoot" component above the
+  # axis top (y_range[2] + y_pad) - anchoring from top_y and then adding the
+  # full bracket_margin_in again double-counted that overshoot, pushing the
+  # title (and the blank space below it) further up the more brackets were
+  # stacked. Anchoring from the axis top instead reserves exactly
+  # total_margin_in above the axis, matching plot.margin below.
+  title_y <- (y_range[2] + y_pad) + (bracket_margin_in + title_extra_in * 0.5) * data_per_inch
+
+  title_x   <- if (title_justify == "left") 0.5 else (n_grp + 1) / 2
+  title_hjust <- if (title_justify == "left") 0 else 0.5
+
+  p <- p +
+    annotate("text", x = title_x, y = title_y,
+             label = if (!is.null(title)) title else metric,
+             hjust = title_hjust, vjust = 0.5, fontface = "bold",
+             size = title_size / .pt)
+
+  p + coord_cartesian(ylim = c(y_range[1] - y_pad, y_range[2] + y_pad), clip = "off") +
+    theme(plot.margin = margin(t = total_margin_in, r = 0.08, b = 0.08, l = 0.08,
                                 unit = "in"))
 }
 
@@ -378,12 +532,17 @@ n_significant_pairs <- function(data, metric, group_col = "group", max_groups_fo
 
 
 bracket_plot_height <- function(data, metric, group_col = "group", bracket_size = 4,
-                                 bracket_spacing = 0.15, max_groups_for_brackets = 8,
+                                 bracket_spacing = 0.15, title_size = 16,
+                                 max_groups_for_brackets = 8, log_scale = FALSE,
                                  base_height = 5.5, selected_pairs = NULL) {
   sig_pos <- bracket_layout(data, metric, group_col, bracket_spacing, max_groups_for_brackets, selected_pairs)
-  if (is.null(sig_pos)) return(base_height)
   values <- data[[metric]]
-  base_height + bracket_margin_inches(sig_pos, values, bracket_size, base_height)
+  if (log_scale) values <- log10(values[!is.na(values) & values > 0])
+  bracket_in <- if (is.null(sig_pos)) 0 else {
+    if (log_scale) sig_pos <- log10_sig_pos(sig_pos)
+    bracket_margin_inches(sig_pos, values, bracket_size, base_height)
+  }
+  base_height + bracket_in + title_margin_inches(title_size)
 }
 
 
