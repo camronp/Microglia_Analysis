@@ -10,13 +10,14 @@
 # lives in (e.g. when embedded from another folder), while data_helpers.R
 # always sits right next to this file.
 #
-# Whichever app sources this file must have its working directory set to a
-# folder with the morphology CSV(s) - the macro's own output folder as of the
-# segmentation macro's v1.7, since it writes
-# merged_morphology_data_<experiment>_<date>.csv there directly (see
-# load_morphology_data() in data_helpers.R). Older per-image
-# "morphology_results_*.csv" output (the macro's analysis_csv/ folder) still
-# works too if no macro-written merged CSV is present.
+# Each visitor uploads their own morphology CSV(s) (and optionally a channel
+# intensity CSV) through the browser - nothing is read from disk at startup,
+# so a deployed copy of this app doesn't ship with (or share) any one
+# person's data. Uploaded files are copied into a per-session temp folder,
+# preserving their original filenames, so the existing filename-driven
+# parsing in load_morphology_data()/load_intensity_data() (macro-merged CSV
+# vs. legacy per-image CSVs, filename metadata extraction, etc.) keeps
+# working unchanged.
 
 
 required_pkgs <- c("shiny", "DT", "tidyverse", "rstatix", "ggpubr")
@@ -28,24 +29,6 @@ if (length(missing_pkgs) > 0) {
 }
 invisible(lapply(required_pkgs, library, character.only = TRUE))
 
-
-df_raw <- load_morphology_data(".")
-
-intensity_raw <- attach_cell_metadata(load_intensity_data("."), df_raw)
-
-valid_vars      <- c("project", "well_position", "site", "wavelength", "image")
-valid_vars      <- intersect(valid_vars, names(df_raw))
-present_metrics <- intersect(all_cell_metrics, names(df_raw))
-
-metric_choices <- setNames(
-  lapply(names(metric_categories), function(cat) {
-    ms <- intersect(metric_categories[[cat]], present_metrics)
-    if (length(ms) == 0) return(NULL)
-    setNames(ms, sapply(ms, metric_label))
-  }),
-  sapply(names(metric_categories), function(cat) str_to_title(gsub("_", " ", cat)))
-)
-metric_choices <- metric_choices[!sapply(metric_choices, is.null)]
 
 intensity_stat_choices <- c(
   "Mean intensity"          = "mean_intensity",
@@ -66,13 +49,12 @@ microgliaUI <- function(id) {
     sidebarLayout(
       sidebarPanel(
         width = 3,
+        fileInput(ns("morph_files"), "Morphology CSV(s)", multiple = TRUE, accept = ".csv",
+                  placeholder = "merged_morphology_data_*.csv, or morphology_results_*.csv"),
+        fileInput(ns("intensity_file"), "Channel intensity CSV (optional)", accept = ".csv",
+                  placeholder = "channel_intensity_results_*.csv"),
         uiOutput(ns("data_summary")),
-        actionButton(ns("reload_data"), "Reload data", width = "100%",
-                     title = "Rescan this folder for new/changed CSVs and rebuild the merged data cache"),
-        br(), br(),
-        selectInput(ns("comparison_variable"), "Compare by",
-                    choices = setNames(valid_vars, sapply(valid_vars, pretty_var)),
-                    selected = if ("well_position" %in% valid_vars) "well_position" else valid_vars[1]),
+        uiOutput(ns("comparison_variable_ui")),
         fluidRow(
           column(6, actionButton(ns("select_all"), "Select all", width = "100%")),
           column(6, actionButton(ns("select_none"), "Select none", width = "100%"))
@@ -81,7 +63,7 @@ microgliaUI <- function(id) {
         checkboxGroupInput(ns("selected_levels"), "Samples to plot", choices = NULL, inline = TRUE),
         uiOutput(ns("rename_ui")),
         hr(),
-        selectInput(ns("metric"), "Metric", choices = metric_choices),
+        uiOutput(ns("metric_ui")),
         textInput(ns("plot_title"), "Plot title", value = "",
                   placeholder = "leave blank to use the metric name"),
         sliderInput(ns("bracket_size"), "Bracket/asterisk size", min = 2, max = 8,
@@ -140,25 +122,95 @@ microgliaServer <- function(id) {
   moduleServer(id, function(input, output, session) {
     ns <- session$ns
 
-    df_store <- reactiveVal(df_raw)
-    intensity_store <- reactiveVal(intensity_raw)
+    # ---- per-session upload staging -----------------------------------
+    # Uploaded files land at random tmp paths (input$x$datapath); copying
+    # them into a per-session folder under their real name lets
+    # load_morphology_data()/load_intensity_data() keep matching filenames
+    # by pattern exactly as they do when reading a macro output folder
+    # directly. Kept in separate subfolders so re-uploading one doesn't
+    # require touching (or accidentally stacking up stale copies of) the
+    # other.
+    session_dir  <- file.path(tempdir(), paste0("microglia_", session$token))
+    morph_dir    <- file.path(session_dir, "morphology")
+    intensity_dir <- file.path(session_dir, "intensity")
+    dir.create(morph_dir, recursive = TRUE, showWarnings = FALSE)
+    dir.create(intensity_dir, recursive = TRUE, showWarnings = FALSE)
+    session$onSessionEnded(function() unlink(session_dir, recursive = TRUE))
 
-    observeEvent(input$reload_data, {
-      showNotification("Rescanning CSVs and rebuilding the merged data cache",
-                        id = "reload", duration = NULL, type = "message")
-      new_morph <- load_morphology_data(".", force_rebuild = TRUE)
-      df_store(new_morph)
-      intensity_store(attach_cell_metadata(load_intensity_data("."), new_morph))
-      removeNotification("reload")
+    df_store <- reactiveVal(NULL)
+    intensity_store <- reactiveVal(tibble())
+
+    stage_upload <- function(fd, dir) {
+      old <- list.files(dir, pattern = "\\.csv$", full.names = TRUE)
+      if (length(old) > 0) unlink(old)
+      file.copy(fd$datapath, file.path(dir, fd$name), overwrite = TRUE)
+    }
+
+    observeEvent(input$morph_files, {
+      stage_upload(input$morph_files, morph_dir)
+      new_morph <- tryCatch(load_morphology_data(morph_dir, force_rebuild = TRUE),
+                             error = function(e) {
+                               showNotification(paste("Couldn't read morphology CSV(s):", conditionMessage(e)),
+                                                 type = "error", duration = NULL)
+                               NULL
+                             })
+      if (!is.null(new_morph)) {
+        df_store(new_morph)
+        idf <- isolate(intensity_store())
+        if (nrow(idf) > 0) intensity_store(attach_cell_metadata(idf, new_morph))
+      }
+    })
+
+    observeEvent(input$intensity_file, {
+      stage_upload(input$intensity_file, intensity_dir)
+      new_intensity <- tryCatch(load_intensity_data(intensity_dir),
+                                 error = function(e) {
+                                   showNotification(paste("Couldn't read intensity CSV:", conditionMessage(e)),
+                                                     type = "error", duration = NULL)
+                                   NULL
+                                 })
+      df <- isolate(df_store())
+      if (!is.null(new_intensity) && !is.null(df)) {
+        intensity_store(attach_cell_metadata(new_intensity, df))
+      } else if (!is.null(new_intensity)) {
+        intensity_store(new_intensity)
+      }
+    })
+
+    valid_vars_r <- reactive({
+      df <- df_store(); req(df)
+      intersect(c("project", "well_position", "site", "wavelength", "image"), names(df))
+    })
+
+    present_metrics_r <- reactive({
+      df <- df_store(); req(df)
+      intersect(all_cell_metrics, names(df))
+    })
+
+    metric_choices_r <- reactive({
+      pm <- present_metrics_r()
+      choices <- setNames(
+        lapply(names(metric_categories), function(cat) {
+          ms <- intersect(metric_categories[[cat]], pm)
+          if (length(ms) == 0) return(NULL)
+          setNames(ms, sapply(ms, metric_label))
+        }),
+        sapply(names(metric_categories), function(cat) str_to_title(gsub("_", " ", cat)))
+      )
+      choices[!sapply(choices, is.null)]
     })
 
     output$data_summary <- renderUI({
       df <- df_store()
+      if (is.null(df)) {
+        return(helpText("Upload your morphology CSV(s) above to begin",
+                         "(optionally add the channel intensity CSV too)."))
+      }
       idf <- intensity_store()
       helpText(
         strong(n_distinct(df$image_id)), "images,",
         strong(format(nrow(df), big.mark = ",")), "cells loaded from",
-        strong(n_distinct(df$source_file)), "CSV file(s) in this folder.",
+        strong(n_distinct(df$source_file)), "CSV file(s).",
         if (nrow(idf) > 0) {
           tagList(br(), strong(format(nrow(idf), big.mark = ",")), "intensity measurements across",
                   strong(n_distinct(idf$channel)), "channel(s).",
@@ -170,6 +222,18 @@ microgliaServer <- function(id) {
                   })
         }
       )
+    })
+
+    output$comparison_variable_ui <- renderUI({
+      vv <- valid_vars_r()
+      req(length(vv) > 0)
+      selectInput(ns("comparison_variable"), "Compare by",
+                  choices = setNames(vv, sapply(vv, pretty_var)),
+                  selected = if ("well_position" %in% vv) "well_position" else vv[1])
+    })
+
+    output$metric_ui <- renderUI({
+      selectInput(ns("metric"), "Metric", choices = metric_choices_r())
     })
 
     levels_all <- reactive({
@@ -220,7 +284,7 @@ microgliaServer <- function(id) {
     }
 
     filtered_df <- reactive({
-      req(length(input$selected_levels) > 0)
+      req(df_store(), input$comparison_variable, length(input$selected_levels) > 0)
       apply_group_selection(df_store(), input$comparison_variable, rename_map())
     })
 
@@ -350,7 +414,7 @@ microgliaServer <- function(id) {
     output$download_pairwise_all <- downloadHandler(
       filename = function() paste0("pairwise_all_metrics_", Sys.Date(), ".csv"),
       content = function(file) {
-        res <- compare_pairs_all_metrics(filtered_df(), present_metrics, "group")
+        res <- compare_pairs_all_metrics(filtered_df(), present_metrics_r(), "group")
         readr::write_csv(res, file)
       }
     )
@@ -374,15 +438,13 @@ microgliaServer <- function(id) {
       }
     )
 
-    # Built reactively (not static UI) so that if no channel_intensity_results_*.csv
-    # existed at app start, running the macro later
+    # Built reactively (not static UI) so the tab's content follows whatever
+    # has (or hasn't) been uploaded so far.
     output$intensity_tab_ui <- renderUI({
       idf <- intensity_store()
       if (nrow(idf) == 0) {
         return(div(style = "color: #a00; font-weight: bold;",
-                    "No channel_intensity_results_*.csv files found in this folder yet",
-                    "run the Channel Intensity Quantification macro first, then use ",
-                    "'Reload data' in the sidebar."))
+                    "Upload a channel_intensity_results_*.csv file in the sidebar to use this tab."))
       }
       tagList(
         fluidRow(

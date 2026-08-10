@@ -2,8 +2,19 @@
 # analysis_v2.1.Rmd and app.R. Sourced by both so behavior never drifts
 # between the static report and the interactive app.
 #
-# Assumes the caller has already loaded tidyverse (dplyr/stringr/purrr/readr)
-# and rstatix.
+# Loads its own required packages so it works regardless of what has (or
+# hasn't) been loaded before it's sourced - it uses ggplot2 at source time
+# (building theme_pub below), so it can't just assume the caller loaded
+# tidyverse first.
+
+required_pkgs <- c("tidyverse", "rstatix", "ggpubr")
+missing_pkgs <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Missing required package(s): ", paste(missing_pkgs, collapse = ", "),
+       ".\nInstall with: install.packages(c(",
+       paste0('"', missing_pkgs, '"', collapse = ", "), "))")
+}
+invisible(lapply(required_pkgs, library, character.only = TRUE))
 
 okabe <- c("#0072B2", "#E69F00", "#009E73", "#D55E00",
            "#CC79A7", "#56B4E9", "#F0E442", "#000000")
