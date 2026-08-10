@@ -48,6 +48,10 @@ resolve_palette <- function(name, n, custom_colors = NULL) {
   )
 }
 
+# Applied explicitly by plot_single_metric_pub() (rather than via
+# theme_set()/scale_*_discrete() overrides) so this styling stays scoped to
+# this app's own plots instead of mutating ggplot's global defaults for
+# whatever else shares the R process (e.g. other tabs in a combined app).
 theme_pub <- theme_minimal(base_size = 15) +
   theme(
     axis.line          = element_line(linewidth = 0.8, colour = "black"),
@@ -61,10 +65,6 @@ theme_pub <- theme_minimal(base_size = 15) +
     plot.title         = element_text(face = "bold", size = rel(1.05)),
     plot.subtitle      = element_text(colour = "grey30", size = rel(0.85))
   )
-theme_set(theme_pub)
-
-scale_colour_discrete <- function(...) discrete_scale("colour", palette = okabe_pal, ...)
-scale_fill_discrete   <- function(...) discrete_scale("fill", palette = okabe_pal, ...)
 
 # ---- Metric metadata ---------------------------------------------------
 # Columns the Fiji macro produces, organized by what they describe
@@ -512,14 +512,13 @@ plot_single_metric_pub <- function(data, metric, group_col = "group", group_labe
     geom_boxplot(width = 0.15, alpha = 0.9, colour = "black", outlier.shape = NA, linewidth = 0.4) +
     geom_jitter(width = 0.08, alpha = 0.5, size = 1.4, shape = 16, colour = "grey20") +
     labs(x = group_label, y = metric_label(metric), fill = group_label) +
+    theme_pub +
     theme(legend.position = if (n_grp > 8) "none" else "right",
           axis.title  = element_text(size = label_size),
           axis.text.x = element_text(angle = 30, hjust = 1, size = label_size * 0.8),
           axis.text.y = element_text(size = label_size * 0.8))
 
-  if (!is.null(palette)) {
-    p <- p + scale_fill_manual(values = palette)
-  }
+  p <- p + scale_fill_manual(values = if (!is.null(palette)) palette else okabe_pal(n_grp))
 
   if (log_scale) {
     p <- p + scale_y_continuous(labels = function(x) scales::comma(round(10^x)))
