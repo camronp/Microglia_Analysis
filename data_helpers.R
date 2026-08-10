@@ -169,72 +169,118 @@ parse_filename_metadata <- function(filename) {
 }
 
 # Data loading, with a merged-CSV cache
+#
+# Since v1.7 of the segmentation macro, the macro itself also writes a single
+# merged CSV straight into `dir` as it runs - named
+# "merged_morphology_data_<experiment_tag>_<run_date>.csv" (experiment_tag
+# is the input folder's name, run_date is the run's start time) - already
+# carrying every derived column (sample_id, image_id, cell_number, project,
+# well_position, site, wavelength, image, ramification_index_2d) this
+# function used to add itself when merging the per-image CSVs. When one or
+# more of those are present, they're read directly (no per-image parsing, no
+# R-side cache) since they already are the merge; one file per macro run, so
+# running the macro on several experiments/batches just adds more files here
+# and they all get combined. Older setups without any macro-written merged
+# CSV fall back to the original behavior: parse the per-image
+# "morphology_results_*.csv" files and cache the result in `cache_file`.
 
 load_morphology_data <- function(dir = ".",
                                   metadata_file = file.path(dir, "sample_metadata.csv"),
                                   cache_file = file.path(dir, "merged_morphology_data.csv"),
                                   force_rebuild = FALSE) {
-  csv_files <- list.files(dir, pattern = "\\.csv$", full.names = TRUE)
-  csv_files <- csv_files[!basename(csv_files) %in%
-                           basename(c(metadata_file, cache_file, "merged_intensity_data.csv"))]
-  csv_files <- csv_files[!grepl("^channel_intensity_results_.*\\.csv$", basename(csv_files))]
+  macro_merged_pattern <- "^merged_morphology_data_.+\\.csv$"
+  macro_merged_files <- list.files(dir, pattern = macro_merged_pattern, full.names = TRUE)
 
-  cache_exists <- file.exists(cache_file)
-  cache_fresh <- cache_exists && (
-    length(csv_files) == 0 ||
-      file.info(cache_file)$mtime >= max(file.info(csv_files)$mtime)
-  )
+  if (length(macro_merged_files) > 0) {
+    if (force_rebuild)
+      message("force_rebuild has no effect on macro-written merged CSVs - they're ",
+              "already the merge, and are re-read fresh from disk on every call.")
+    message("Reading ", length(macro_merged_files), " macro-written merged CSV(s): ",
+            paste(basename(macro_merged_files), collapse = ", "))
 
-  if (!force_rebuild && cache_fresh) {
-    message("Loading merged data cache '", basename(cache_file), "' (",
-            "delete it, or set force_rebuild = TRUE, to re-parse the source CSVs).")
-    df <- readr::read_csv(cache_file, show_col_types = FALSE)
+    # Pin these to character at read time (readr's per-file type guessing is
+    # inconsistent otherwise - e.g. an "image" column guesses character in a
+    # file with a leading-zero value like "01" but double in a file without
+    # one, which then makes map_dfr()'s row-binding fail across files) so
+    # they match the legacy parse_filename_metadata() path, which always
+    # returns character.
+    meta_col_types <- readr::cols(
+      project = readr::col_character(), well_position = readr::col_character(),
+      site = readr::col_character(), wavelength = readr::col_character(),
+      image = readr::col_character(), .default = readr::col_guess()
+    )
+    df <- purrr::map_dfr(macro_merged_files, readr::read_csv,
+                          col_types = meta_col_types, show_col_types = FALSE)
+
+    # Normalize the "" the macro writes for tokens it couldn't parse out of
+    # the filename (e.g. no well-position token) to NA, matching the legacy path.
+    meta_cols <- intersect(c("project", "well_position", "site", "wavelength", "image"), names(df))
+    df <- df %>% mutate(across(all_of(meta_cols), ~ na_if(.x, "")))
+
   } else {
-    if (length(csv_files) == 0)
-      stop("No CSV files found in '", normalizePath(dir), "'. ",
-           "Point `dir` at the macro's analysis_csv/ output folder.")
+    csv_files <- list.files(dir, pattern = "\\.csv$", full.names = TRUE)
+    csv_files <- csv_files[!basename(csv_files) %in%
+                             basename(c(metadata_file, cache_file, "merged_intensity_data.csv"))]
+    csv_files <- csv_files[!grepl("^channel_intensity_results_.*\\.csv$", basename(csv_files))]
+    csv_files <- csv_files[!grepl(macro_merged_pattern, basename(csv_files))]
 
-    message("Parsing ", length(csv_files), " source CSV(s) - this is slow the ",
-            "first time (and whenever new CSVs are added); after this it will ",
-            "read the cached '", basename(cache_file), "' instead.")
+    cache_exists <- file.exists(cache_file)
+    cache_fresh <- cache_exists && (
+      length(csv_files) == 0 ||
+        file.info(cache_file)$mtime >= max(file.info(csv_files)$mtime)
+    )
 
-    read_one <- function(f) {
-      d <- readr::read_csv(f, show_col_types = FALSE)
-      if (!all(c("cell_name", "area_um2") %in% names(d))) {
-        message("Skipping '", basename(f),
-                "' - not a morphology CSV (missing cell_name/area_um2).")
-        return(NULL)
+    if (!force_rebuild && cache_fresh) {
+      message("Loading merged data cache '", basename(cache_file), "' (",
+              "delete it, or set force_rebuild = TRUE, to re-parse the source CSVs).")
+      df <- readr::read_csv(cache_file, show_col_types = FALSE)
+    } else {
+      if (length(csv_files) == 0)
+        stop("No CSV files found in '", normalizePath(dir), "'. ",
+             "Point `dir` at the macro's analysis_csv/ output folder.")
+
+      message("Parsing ", length(csv_files), " source CSV(s) - this is slow the ",
+              "first time (and whenever new CSVs are added); after this it will ",
+              "read the cached '", basename(cache_file), "' instead.")
+
+      read_one <- function(f) {
+        d <- readr::read_csv(f, show_col_types = FALSE)
+        if (!all(c("cell_name", "area_um2") %in% names(d))) {
+          message("Skipping '", basename(f),
+                  "' - not a morphology CSV (missing cell_name/area_um2).")
+          return(NULL)
+        }
+        dplyr::mutate(d, source_file = basename(f))
       }
-      dplyr::mutate(d, source_file = basename(f))
+      raw <- purrr::map_dfr(csv_files, read_one)
+      if (nrow(raw) == 0)
+        stop("Found CSVs in '", normalizePath(dir), "' but none had the expected ",
+             "columns (need at least cell_name and area_um2). Make sure you are ",
+             "pointing at the macro's analysis_csv/ output.")
+
+      file_meta <- purrr::map_dfr(unique(raw$source_file), function(f) {
+        bind_cols(tibble(source_file = f), parse_filename_metadata(f))
+      })
+
+      df <- bind_cols(parse_cell_name(raw$cell_name), raw) %>%
+        left_join(file_meta, by = "source_file") %>%
+        mutate(ramification_index_2d = perimeter_um / (2 * sqrt(pi * area_um2)))
+
+
+      if (!all(c("centroid_x_um", "centroid_y_um") %in% names(df))) {
+        df <- df %>% mutate(
+          centroid_x_um = as.numeric(str_extract(cell_name, "(?<=_X)\\d+")),
+          centroid_y_um = as.numeric(str_extract(cell_name, "(?<=_Y)\\d+"))
+        )
+      }
+
+      tryCatch({
+        readr::write_csv(df, cache_file)
+        message("Wrote merged data cache: ", normalizePath(cache_file))
+      }, error = function(e) {
+        warning("Could not write merged data cache '", cache_file, "': ", conditionMessage(e))
+      })
     }
-    raw <- purrr::map_dfr(csv_files, read_one)
-    if (nrow(raw) == 0)
-      stop("Found CSVs in '", normalizePath(dir), "' but none had the expected ",
-           "columns (need at least cell_name and area_um2). Make sure you are ",
-           "pointing at the macro's analysis_csv/ output.")
-
-    file_meta <- purrr::map_dfr(unique(raw$source_file), function(f) {
-      bind_cols(tibble(source_file = f), parse_filename_metadata(f))
-    })
-
-    df <- bind_cols(parse_cell_name(raw$cell_name), raw) %>%
-      left_join(file_meta, by = "source_file") %>%
-      mutate(ramification_index_2d = perimeter_um / (2 * sqrt(pi * area_um2)))
-
-    
-    if (!all(c("centroid_x_um", "centroid_y_um") %in% names(df))) {
-      df <- df %>% mutate(
-        centroid_x_um = as.numeric(str_extract(cell_name, "(?<=_X)\\d+")),
-        centroid_y_um = as.numeric(str_extract(cell_name, "(?<=_Y)\\d+"))
-      )
-    }
-
-    tryCatch({
-      readr::write_csv(df, cache_file)
-      message("Wrote merged data cache: ", normalizePath(cache_file))
-    }, error = function(e) {
-      warning("Could not write merged data cache '", cache_file, "': ", conditionMessage(e))
-    })
   }
 
   if (file.exists(metadata_file)) {

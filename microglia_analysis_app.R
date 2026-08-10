@@ -1,7 +1,11 @@
 # Interactive Microglia Analysis
 #
-# Run from the same folder as the morphology CSV(s) (the macro's analysis_csv/
-# output) via shiny::runApp(). 
+# Run from the same folder as the morphology CSV(s) via shiny::runApp().
+# As of the segmentation macro's v1.7, that's the macro's own folder - it
+# writes merged_morphology_data_<experiment>_<date>.csv there directly (see
+# load_morphology_data() in data_helpers.R). Older per-image
+# "morphology_results_*.csv" output (the macro's analysis_csv/ folder) still
+# works too if no macro-written merged CSV is present.
 
 
 required_pkgs <- c("shiny", "DT", "tidyverse", "rstatix", "ggpubr")
