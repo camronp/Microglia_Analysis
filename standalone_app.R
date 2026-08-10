@@ -6,6 +6,7 @@
 # working directory), then open this file in RStudio and click "Run App"
 # (or run shiny::runApp() from that folder).
 
+source("data_helpers.R")
 source("microglia_analysis_app.R")
 
 shinyApp(

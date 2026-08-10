@@ -4,6 +4,12 @@
 # as a tab in another Shiny app (see PolyLab_Tools). To run it on its own,
 # use standalone_app.R in this same folder.
 #
+# The caller must source data_helpers.R (from wherever this file's copy of
+# it lives) before sourcing this file - not done internally here, since this
+# file may be sourced from a different working directory than the one it
+# lives in (e.g. when embedded from another folder), while data_helpers.R
+# always sits right next to this file.
+#
 # Whichever app sources this file must have its working directory set to a
 # folder with the morphology CSV(s) - the macro's own output folder as of the
 # segmentation macro's v1.7, since it writes
@@ -21,9 +27,6 @@ if (length(missing_pkgs) > 0) {
        paste0('"', missing_pkgs, '"', collapse = ", "), "))")
 }
 invisible(lapply(required_pkgs, library, character.only = TRUE))
-
-
-source("data_helpers.R")
 
 
 df_raw <- load_morphology_data(".")
